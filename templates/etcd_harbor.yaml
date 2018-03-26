@@ -1,0 +1,270 @@
+heat_template_version: 2014-10-16
+
+description: >
+  Create a vm to support harbor and etcd service.
+
+parameters:
+
+  server_name:
+    type: string
+    description: name of our server
+    default: etcd_harbor
+
+  registry_dns:
+    type: string
+    description: dns name of our registry
+    default: hub.huayun.io
+
+  ssh_key_name:
+    type: string
+    description: name of ssh key to be provisioned on our server
+
+  external_network:
+    type: string
+    default: public
+    description: uuid/name of a network to use for floating ip addresses
+
+  server_image:
+    type: string
+    description: glance image used to boot the server
+
+  server_flavor:
+    type: string
+    default: 4-4096-10
+    description: flavor to use when booting the server
+
+  registry_admin_password:
+    type: string
+    default: passw0rd
+    description: The password of admin in registry
+
+  registry_service_port:
+    type: number
+    default: 2375
+    description: The harbor service port
+
+  fixed_network:
+    type: string
+    description: Network from which to allocate fixed addresses.
+
+  fixed_subnet:
+    type: string
+    description: Subnet from which to allocate fixed addresses.
+
+  volume_size:
+    type: number
+    description: >
+      size of a cinder volume to allocate to docker for container/image
+      storage
+
+  wait_condition_timeout:
+    type: number
+    description : >
+      timeout for the Wait Conditions
+    default: 600
+
+resources:
+
+  harbor_wait_handle:
+    type: OS::Heat::WaitConditionHandle
+
+  harbor_wait_condition:
+    type: OS::Heat::WaitCondition
+    depends_on: server_vm
+    properties:
+      handle: {get_resource: harbor_wait_handle}
+      timeout: {get_param: wait_condition_timeout}
+
+  ######################################################################
+  #
+  # security groups.  we need to permit network traffic of various
+  # sorts.
+  #
+
+  secgroup_server:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      rules:
+        - protocol: icmp
+        - protocol: udp
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+        - protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+        - protocol: tcp
+          port_range_min: 2379
+          port_range_max: 2379
+        - protocol: tcp
+          port_range_min: {get_param: registry_service_port}
+          port_range_max: {get_param: registry_service_port}
+
+  ######################################################################
+  #
+  # software configs.  these are components that are combined into
+  # a multipart MIME user-data archive.
+  #
+
+  write_heat_params:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config:
+        str_replace:
+          template: {get_file: fragments/write-heat-params.yaml}
+          params:
+            "$REGISTRY_DNS_NAME": {get_param: registry_dns}
+            "$REGISTRY_ADMIN_PASSWORD": {get_param: registry_admin_password}
+            "$REGISTRY_SERVICE_PORT": {get_param: registry_service_port}
+            "$REGISTRY_EXTERNAL_SERVER_IP": {get_attr: [server_floating, floating_ip_address]}
+            "$REGISTRY_SERVER_IP": {get_attr: [server_eth0, fixed_ips, 0, ip_address]}
+            "$WAIT_CURL": {get_attr: [harbor_wait_handle, curl_cli]}
+
+
+  container_user:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: {get_file: fragments/container-user.yaml}
+
+  wc_notify:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: {get_file: fragments/wc-notify.sh}
+
+  server_init:
+    type: OS::Heat::MultipartMime
+    properties:
+      parts:
+        - config: {get_resource: write_heat_params}
+        - config: {get_resource: container_user}
+        - config: {get_resource: configure_enable_docker}
+        - config: {get_resource: configure_enable_etcd}
+        - config: {get_resource: configure_enable_harbor}
+        - config: {get_resource: wc_notify}
+
+
+  ######################################################################
+  #
+  # harbor server.
+  #
+
+  server_vm:
+    type: OS::Nova::Server
+    properties:
+      image: {get_param: server_image}
+      flavor: {get_param: server_flavor}
+      key_name: {get_param: ssh_key_name}
+      user_data_format: RAW
+      user_data: {get_resource: server_init}
+      networks:
+        - port: {get_resource: server_eth0}
+      name: {get_param: server_name}
+
+
+  server_eth0:
+    type: OS::Neutron::Port
+    properties:
+      network: {get_param: fixed_network}
+      security_groups:
+        - {get_resource: secgroup_server}
+      fixed_ips:
+        - subnet: {get_param: fixed_subnet}
+      replacement_policy: AUTO
+
+  server_floating:
+    type: Optional::SERVER::Neutron::FloatingIP
+    properties:
+      floating_network: {get_param: external_network}
+      port_id: {get_resource: server_eth0}
+
+  configure_enable_docker:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: {get_file: fragments/config-enable-docker.sh}
+
+  configure_enable_etcd:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: {get_file: fragments/config-enable-etcd.sh}
+
+  configure_enable_harbor:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: {get_file: fragments/config-enable-harbor.sh}
+
+  ######################################################################
+  #
+  # harbor storage.  This allocates a cinder volume and attaches it
+  # to the harbor registry.
+  #
+  # /mnt/harbor is harbor home dir, set by image.
+
+  harbor_volume:
+    type: Optional::Cinder::Volume
+    properties:
+      size: {get_param: volume_size}
+
+  harbor_volume_attach:
+    type: Optional::Cinder::VolumeAttachment
+    properties:
+      instance_uuid: {get_resource: server_vm}
+      volume_id: {get_resource: harbor_volume}
+      mountpoint: /mnt/harbor
+
+outputs:
+
+  server_external_ip:
+    value: {get_attr: [server_floating, floating_ip_address]}
+    description: >
+      This is the "public" IP address of the server node. Use this IP address
+      to visit the registry and etcd services.
+
+  server_ip:
+    value: {get_attr: [server_eth0, fixed_ips, 0, ip_address]}
+    description: >
+      This is the IP address of the server node. Use this IP address
+      to visit the registry and etcd services.
+
+  external_etcd:
+    description: >
+      the external etcd services.
+    value:
+      list_join:
+        - ''
+        - - 'http://'
+          - {get_attr: [server_floating, floating_ip_address]}
+          - ':2379'
+
+  internal_etcd:
+    description: >
+      the internal etcd services.
+    value:
+      list_join:
+        - ''
+        - - 'http://'
+          - {get_attr: [server_eth0, fixed_ips, 0, ip_address]}
+          - ':2379'
+
+  external_harbor:
+    value:
+      list_join:
+        - ''
+        - - 'http://'
+          - {get_attr: [server_floating, floating_ip_address]}
+          - ':'
+          - {get_param: registry_service_port}
+
+  internal_harbor:
+    value:
+      list_join:
+        - ''
+        - - 'http://'
+          - {get_attr: [server_eth0, fixed_ips, 0, ip_address]}
+          - ':'
+          - {get_param: registry_service_port}

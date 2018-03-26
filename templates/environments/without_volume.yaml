@@ -1,0 +1,4 @@
+# Environment file to NOT use a cinder volume to store containers
+resource_registry:
+  "Optional::Cinder::Volume": "OS::Heat::None"
+  "Optional::Cinder::VolumeAttachment": "OS::Heat::None"

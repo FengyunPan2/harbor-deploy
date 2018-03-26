@@ -1,0 +1,4 @@
+# Environment file to use a cinder volume to store containers
+resource_registry:
+  "Optional::Cinder::Volume": "OS::Cinder::Volume"
+  "Optional::Cinder::VolumeAttachment": "OS::Cinder::VolumeAttachment"

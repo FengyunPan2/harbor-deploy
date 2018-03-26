@@ -1,0 +1,11 @@
+#cloud-config
+disable_root: 0
+ssh_pwauth: 1
+system_info:
+  default_user:
+    name: harbor
+    lock_passwd: true
+    gecos: Kubernetes Interactive User
+    groups: [wheel, adm, systemd-journal]
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    shell: /bin/bash
